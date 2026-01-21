@@ -1,0 +1,167 @@
+let
+    // 1. SOURCE DATA EXTRACTION
+    SourceQuery = "
+        SELECT 
+            *,
+            CASE 
+                WHEN ""Remarks"" IN ('Working', 'B shift', '-') THEN '-'
+                WHEN ""Vehicle Type"" != 'BOV' AND ""Remarks"" = 'Line issue' THEN '-'
+                WHEN ""Remarks"" IN ('Line issue', 'Converter Fault') THEN 'Line issue'
+                WHEN ""Remarks"" IN ('Gps Issue', 'GPS Missing') THEN ""Remarks""
+                WHEN ""Remarks"" NOT IN ('Line issue', 'Gps Issue', 'Converter Fault', 'GPS Missing', 'Working') 
+                     AND ""Deployed Status"" LIKE 'Deployed%' THEN 'N'
+                WHEN ""Remarks"" NOT IN ('Line issue', 'Gps Issue', 'Converter Fault', 'GPS Missing', 'Working') 
+                     THEN 'BreakDown'
+                ELSE COALESCE(""Remarks"", '-')
+            END AS ""Updated Remarks""
+        FROM show_gps_deployment_status()",
+    
+    Source = Odbc.Query("dsn=PostgreSQL35W", SourceQuery),
+
+    // 2. INITIAL TRANSFORMATIONS
+    BaseTransformations = 
+        Source
+        // Column reordering for logical grouping
+        |> Table.ReorderColumns({
+            "Date", 
+            "GPS IMEI No", 
+            "Vehicle Registration No", 
+            "V ID", 
+            "Vehicle Type", 
+            "Last Log Received At", 
+            "Age", 
+            "Deployed Status", 
+            "Facility", 
+            "Technician", 
+            "Remarks", 
+            "Remarks Date", 
+            "Updated Remarks"
+        })
+        // Add working status based on age threshold
+        |> Table.AddColumn(
+            "Status", 
+            each if [Age] >= 2 then "Not Working" else "Working"
+        )
+        // Finalize initial column order
+        |> Table.ReorderColumns({
+            "Date", 
+            "GPS IMEI No", 
+            "Vehicle Registration No", 
+            "V ID", 
+            "Vehicle Type", 
+            "Last Log Received At", 
+            "Status", 
+            "Updated Remarks", 
+            "Age", 
+            "Remarks", 
+            "Deployed Status", 
+            "Facility", 
+            "Technician", 
+            "Remarks Date"
+        }),
+
+    // 3. DATA ENRICHMENT (JOIN WITH MASTER DATA)
+    EnrichedData = 
+        let
+            // Left join with master table
+            JoinedTables = Table.NestedJoin(
+                BaseTransformations, 
+                {"Vehicle Registration No"}, 
+                Master, 
+                {"Register Number"}, 
+                "Master", 
+                JoinKind.LeftOuter
+            ),
+            
+            // Expand master columns with clear prefixes
+            Expanded = Table.ExpandTableColumn(
+                JoinedTables, 
+                "Master", 
+                {"Faclity", "Technician", "Zone"}, 
+                {
+                    "Master.Faclity", 
+                    "Master.Technician", 
+                    "Master.Zone"
+                }
+            )
+        in
+            Expanded,
+
+    // 4. COLUMN ORGANIZATION
+    ColumnOrganization = 
+        let
+            // Group related columns together
+            InitialOrder = Table.ReorderColumns(
+                EnrichedData,
+                {
+                    "Date", 
+                    "GPS IMEI No", 
+                    "Vehicle Registration No", 
+                    "V ID", 
+                    "Vehicle Type", 
+                    "Last Log Received At", 
+                    "Status", 
+                    "Updated Remarks", 
+                    "Age", 
+                    "Remarks", 
+                    "Deployed Status", 
+                    "Master.Zone", 
+                    "Facility", 
+                    "Technician", 
+                    "Remarks Date", 
+                    "Master.Faclity", 
+                    "Master.Technician"
+                }
+            ),
+            
+            // Final business logic grouping
+            BusinessGrouping = Table.ReorderColumns(
+                InitialOrder,
+                {
+                    "Date", 
+                    "GPS IMEI No", 
+                    "Vehicle Registration No", 
+                    "V ID", 
+                    "Vehicle Type", 
+                    "Master.Faclity",                      // Primary facility
+                    "Last Log Received At", 
+                    "Status",                              // Working status
+                    "Master.Technician",                   // Primary technician
+                    "Updated Remarks",                     // Standardized remarks
+                    "Age", 
+                    "Ref.Remarks",                         // Reference remarks
+                    "Master.Zone",                         // Geographic zone
+                    "Ref.Deployed Status",                 // Reference deployment
+                    "Ref.Facility",                        // Reference facility
+                    "Ref.Technician",                      // Reference technician
+                    "Ref.Remarks Date"                     // Reference date
+                }
+            )
+        in
+            BusinessGrouping,
+
+    // 5. FINAL STRUCTURE AND RENAMING
+    FinalStructure = 
+        ColumnOrganization
+        // Rename original columns to indicate they're reference data
+        |> Table.RenameColumns({
+            {"Deployed Status", "Ref.Deployed Status"},
+            {"Facility", "Ref.Facility"},
+            {"Technician", "Ref.Technician"},
+            {"Remarks Date", "Ref.Remarks Date"},
+            {"Remarks", "Ref.Remarks"}
+        }),
+
+    // 6. FINAL SORTING FOR REPORTING
+    SortedOutput = 
+        Table.Sort(
+            FinalStructure,
+            {
+                {"Master.Technician", Order.Ascending},     // Primary sort: Technician
+                {"Master.Faclity", Order.Ascending},        // Secondary sort: Facility
+                {"Updated Remarks", Order.Descending}       // Tertiary sort: Status priority
+            }
+        )
+
+in
+    SortedOutput
